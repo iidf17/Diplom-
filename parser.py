@@ -1,16 +1,23 @@
-import torch
-import networkx as nx
-import matplotlib.pyplot as plt
 import os
+import torch
 import pythoncom
 from win32com.client import Dispatch, gencache
 
 def get_kompas_api7():
-    module = gencache.EnsureModule("{69AC2981-37C0-4379-84FD-5DD2F3C0A520}", 0, 1, 0)
-    api = module.IKompasAPIObject(
-        Dispatch("Kompas.Application.7")._oleobj_.QueryInterface(module.IKompasAPIObject.CLSID,
-                                                                 pythoncom.IID_IDispatch))
-    return module, api
+    # module = gencache.EnsureModule("{69AC2981-37C0-4379-84FD-5DD2F3C0A520}", 0, 1, 0)
+    # api = module.IKompasAPIObject(
+    #     Dispatch("Kompas.Application.7")._oleobj_.QueryInterface(module.IKompasAPIObject.CLSID,
+    #                                                              pythoncom.IID_IDispatch))
+    # return module, api
+    try:
+        module = gencache.EnsureModule("{69AC2981-37C0-4379-84FD-5DD2F3C0A520}", 0, 1, 0)
+        api = module.IKompasAPIObject(
+            Dispatch("Kompas.Application.7")._oleobj_.QueryInterface(module.IKompasAPIObject.CLSID,
+                                                                     pythoncom.IID_IDispatch))
+        return module, api
+    except Exception as e:
+        print(f"Error: {e}")
+        return None, None
 
 def get_kompas_api5():
     module = gencache.EnsureModule("{0422828C-F174-495E-AC5D-D31014DBBE87}", 0, 1, 0)
@@ -43,14 +50,15 @@ kompas_object = kompas6_api5_module.KompasObject(Dispatch("Kompas.Application.5"
 kompas_api7_module = gencache.EnsureModule("{69AC2981-37C0-4379-84FD-5DD2F3C0A520}", 0, 1, 0)
 application = kompas_api7_module.IApplication(Dispatch("Kompas.Application.7")._oleobj_.QueryInterface(kompas_api7_module.IApplication.CLSID, pythoncom.IID_IDispatch))
 
-Documents = application.Documents 
+Documents = application.Documents
 
-path = os.getcwd() + "\\filesK"
-files = os.listdir(path) 
-filePath = path + "\\" + files[0]
+import networkx as nx
+import matplotlib.pyplot as plt
 
 def model_to_graph(filePath):
     kompas_document = Documents.Open(filePath, True, False)
+    if kompas_document is None:
+        raise Exception(f"Не удалось открыть файл: {filePath}")
     # Инициализируем граф NetworkX
     G = nx.DiGraph()
     iDocument3D = api5.ActiveDocument3D()
@@ -89,64 +97,60 @@ def model_to_graph(filePath):
     for j in range (faces.GetCount()):
         get_entity(j)
     
+    kompas_document.Close(False)
     return G
-
-
-print(filePath)
-G1 = model_to_graph(filePath)
-
-plt.figure(figsize=(12, 10))
-
-# Располагаем узлы для визуализации
-pos = nx.kamada_kawai_layout(G1)#arf_layout(G)# spring_layout(G, seed=442)  # Автоматическое распределение узлов для логической схемы
-
-# Выделяем узлы разного типа цветом
-face_nodes = [node for node, data in G1.nodes(data=True) if data["type"] == "face"]
-
-nx.draw(G1, pos,with_labels=True, nodelist=face_nodes, node_color="lightblue", node_size=700)
-
-plt.axis("off")
-plt.show()
-
 
 import torch_geometric
 from torch_geometric.utils import from_networkx
 
 def graph_to_data(G: nx.Graph, label: int = None) -> torch_geometric.data.Data:
-    # 1. Метрика для каждого узла
+    largest_scc = max(nx.strongly_connected_components(G), key=len)
+    G = G.subgraph(largest_scc).copy()
+    
     degrees = [val for _, val in G.degree()]
     closeness = list(nx.closeness_centrality(G).values())
     betweenness = list(nx.betweenness_centrality(G).values())
     pagerank = list(nx.pagerank(G).values())
     eccentricity = list(nx.eccentricity(G).values())
     
-    # 2. Собираем признаки в матрицу [num_nodes x num_features]
     features = torch.tensor(
         [[d, c, b, p, e] for d, c, b, p, e in zip(degrees, closeness, betweenness, pagerank, eccentricity)],
         dtype=torch.float
     )
 
-    # 3. Преобразуем в PyG формат
     data = from_networkx(G)
 
-    # 4. Добавляем признаки и метку
     data.x = features
-    if label:
+    if label is not None:
         data.y = torch.tensor([label], dtype=torch.long)
 
     return data
 
 from pandas import read_csv
+import time
 dataset = []
-df_path = os.getcwd() + "\\filesK\\dataset.csv"
+df_path = os.path.join(os.getcwd(), "dataset.csv")
 df = read_csv(df_path)
-for idx, row in df.iterrows():
-    filename = row["filename"]
-    label = row["label"]
-    filepath = os.path.join(os.getcwd() + "\\filesK", filename)
-    G = model_to_graph(filepath)
-    dataset.append(graph_to_data(G, label))
+folders = os.listdir(os.path.join(os.getcwd(), "DSet"))
 
+for f in folders:
+    for idx, row in df.iterrows():
+        try:
+            filename = row["filename"]
+            label = row["label"]
+            modelPath = os.getcwd() + "\\DSet\\" + f + "\\" + filename
+            if not os.path.exists(modelPath):
+                print(f"Файл не существует: {modelPath}")
+                continue
+            G = model_to_graph(modelPath)
+            dataset.append(graph_to_data(G, label))
+        except Exception as ex:
+            print(f"Error: {ex}")
+            break
+        else:
+            print(f"got it! - {modelPath, label}")
+        time.sleep(0.3)
+            
 from torch_geometric.loader import DataLoader
 
 loader = DataLoader(dataset, batch_size=8, shuffle=True)
@@ -177,32 +181,21 @@ class GNN(torch.nn.Module):
         x = self.lin(x)
         return x
     
-
-model = GNN(in_channels=5, hidden_channels=64, num_classes=2)
+model = GNN(in_channels=5, hidden_channels=64, num_classes=4)
 optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
 criterion = torch.nn.CrossEntropyLoss()
 
-for epoch in range(1, 300):
+for epoch in range(1, 900):
     model.train()
     total_loss = 0
 
-    for data in loader:  # один батч (несколько графов)
+    for data in loader: 
         optimizer.zero_grad()
-        out = model(data.x, data.edge_index, data.batch)  # data.batch нужен для глобального пула
+        out = model(data.x, data.edge_index, data.batch)
         loss = criterion(out, data.y)
         loss.backward()
         optimizer.step()
         total_loss += loss.item()
 
-    if epoch % 40 == 0:
+    if epoch % 100 == 0:
         print(f"Epoch {epoch}, Loss: {total_loss:.4f}")
-
-testFilePath = os.getcwd() + "\\filesK\\cube_test.m3d"
-data = model_to_graph(testFilePath)
-test_graph = graph_to_data(data)
-
-with torch.no_grad():
-    out = model(test_graph.x, test_graph.edge_index, test_graph.batch)
-    pred_class = out.mean(dim=0).argmax().item()  # среднее по всем узлам
-    print(f"Предсказанный класс: {pred_class}")
-    
